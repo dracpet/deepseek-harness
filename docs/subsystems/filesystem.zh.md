@@ -239,7 +239,7 @@ interface FileReadOutcome {
 
 ## 已观测文件状态（策略插件）
 
-已观测状态是 `dsh-fs-observation-policy` 插件内部持有的 `WeakMap<owner, Map<targetKey, FsObservation>>`。映射中没有条目表示未见；`{ kind: 'absent' }` 表示 `read` 的元数据未命中，或 `str_replace_editor` 的 `view`、`str_replace`、`insert` 命令发生元数据未命中，从而确认缺失；`{ kind: 'present', version }` 表示 read、write 或 edit 观测到该版本。写入决策把未见和缺失映射到 `createIfAbsent`，把存在映射到 `replaceIfVersion`；编辑决策把未见映射到 `FS_NOT_OBSERVED`，把缺失映射到 `FS_NOT_FOUND`，把存在映射到其版本守卫。所有者从事件 actor 推导（通常是 `exec.agent.session`），被视为不透明且从不读取。dispose（资源释放）时丢弃全部数据（HMR（热模块替换）安全），策略不执行任何文件系统 I/O。
+已观测状态是 `dsh-fs-observation-policy` 插件内部持有的 `WeakMap<owner, Map<targetKey, FsObservation>>`。映射中没有条目表示未见；`{ kind: 'absent' }` 表示 `read` 的元数据未命中，或 `str_replace_editor` 的 `view`、`str_replace`、`insert` 命令发生元数据未命中，从而确认缺失；`{ kind: 'present', version }` 表示 read、write 或 edit 观测到该版本。写入决策把未见和缺失映射到 `createIfAbsent`，把存在映射到 `replaceIfVersion`；编辑决策把未见映射到 `FS_NOT_OBSERVED`，把缺失映射到 `FS_NOT_FOUND`，把存在映射到其版本守卫。所有者从事件 actor 推导（通常是 `exec.agent.session`），被视为不透明且从不读取。成功的 `dsh-tool-fs` 结果把同一观察保存为 `meta.fsObservation`；`session/created` 将这些记录回放到恢复后的会话，无需文件系统 I/O。历史版本仍作为 CAS 基础，因此后来的外部修改仍以 `FS_STALE_VERSION` 失败；没有该元数据的结果在恢复后仍属未观察。dispose（资源释放）时丢弃内存映射（HMR（热模块替换）安全），策略不执行任何文件系统 I/O。
 
 ## 错误分类体系（提供方约定）
 

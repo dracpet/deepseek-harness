@@ -879,15 +879,22 @@ describe('image result presentation', () => {
     height: 260,
     name: 'card.png',
   }
-  const VALUE = { path: '/w/app/shots/card.png', image: REF }
+  const VALUE = {
+    path: '/w/app/shots/card.png',
+    image: REF,
+    fsObservation: {
+      target: { targetKey: 'key:card.png', displayPath: '/w/app/shots/card.png' },
+      observation: { kind: 'present', version: 'v1' },
+    },
+  }
 
-  it('persists the path only, leaving the reference to the result content', async () => {
+  it('persists the path and observation, leaving the reference to the result content', async () => {
     // The settled content already carries the image block with the complete
     // reference, so copying it into meta would keep two records of one fact and a
     // post-execute content replacement would strand the stale copy.
     const ctx = await setup()
     const meta = ctx.tools.get('read_image')?.output.presentationMeta?.({ file_path: 'shots/card.png' }, VALUE)
-    expect(meta).toEqual({ path: VALUE.path })
+    expect(meta).toEqual({ path: VALUE.path, fsObservation: VALUE.fsObservation })
   })
 
   it('carries the committed reference in the result content, not in meta', async () => {
@@ -896,7 +903,7 @@ describe('image result presentation', () => {
     const ctx = await setup()
     const result = await call(ctx, 'read_image', { file_path: 'red.png' }, agentOn('vision-model'))
     expect(result.isError).toBe(false)
-    expect(result.meta).toEqual({ path: await realpath(join(dir, 'red.png')) })
+    expect(result.meta).toEqual({ path: await realpath(join(dir, 'red.png')), fsObservation: expect.any(Object) })
     const image = result.content.find(block => block.type === 'image')
     expect(image?.attachment.width).toBe(1)
     expect(image?.attachment.height).toBe(1)

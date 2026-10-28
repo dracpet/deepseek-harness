@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-fs-observation-policy` makes filesystem tools require an agent to read a file before overwriting or editing it. It also rejects a mutation when the file has changed since that read, and returns a clear instruction to re-read and retry. Reading a missing path authorizes guarded creation, while concurrent creation remains protected. Choose it for deployments that want read-before-write safety; resumed sessions must read targets again because observations are not persisted.
+`dsh-fs-observation-policy` makes filesystem tools require an agent to read a file before overwriting or editing it. It also rejects a mutation when the file has changed since that read, and returns a clear instruction to re-read and retry. Reading a missing path authorizes guarded creation, while concurrent creation remains protected. Successful tool observations persist in result metadata and restore with the Session, while the provider still rejects later external changes.
 
 ## Table of Contents
 
@@ -39,7 +39,7 @@ Load a backend, then this plugin, then the tools. The policy listener should be 
 
 ### What changes for the model
 
-With the policy mounted, `write` creates new files but refuses to overwrite an existing file that the session has not read, `edit` requires a prior read of the target, and a file that changed since it was read fails with `FS_STALE_VERSION`. Absence is recorded too: reading a missing file marks it confirmed absent, so a later `write` may recreate it through the guarded-create flow. A session resumes with no observed state, so it must re-read files before guarded mutations succeed again.
+With the policy mounted, `write` creates new files but refuses to overwrite an existing file that the session has not read, `edit` requires a prior read of the target, and a file that changed since it was read fails with `FS_STALE_VERSION`. Absence is recorded too: reading a missing file marks it confirmed absent, so a later `write` may recreate it through the guarded-create flow. A restored Session rebuilds observations from persisted result metadata; files without that metadata still require a fresh read.
 
 ### Failures and recovery
 
@@ -60,18 +60,18 @@ This section explains the design decisions behind the policy plugin and points a
 The plugin is built on two ideas:
 
 - **Event gate, not method service.** The plugin influences the world only through the `fs/*` events, so it registers no `ctx.fsPolicy` service and has no public methods. Removing it cannot break `dsh-tool-fs` at a service-injection boundary — the tool falls through to the bare provider.
-- **Observed state is a prior-observation record.** A weak owner-to-target map holds three logical states — unseen, confirmed absent, or present at a version. The plugin performs no filesystem I/O of its own; it converts recorded state into the provider's optional guard, and the provider performs the atomic freshness check.
+- **Observed state is a prior-observation record.** A weak owner-to-target map holds three logical states — unseen, confirmed absent, or present at a version. Durable result metadata rebuilds that map when a Session object is restored. The plugin performs no filesystem I/O of its own; it converts recorded state into the provider's optional guard, and the provider performs the atomic freshness check.
 
 ### Source map
 
 | File | Role |
 |---|---|
-| [`src/index.ts`](src/index.ts) | The three `fs/*` listeners and the observed-state gate |
+| [`src/index.ts`](src/index.ts) | The `fs/*` listeners, Session restore, and the observed-state gate |
 | [`src/types.ts`](src/types.ts) | The opaque event actor shape from which the owner session is derived |
 
 ### Decision flow
 
-`fs/write-intent` resolves unseen or confirmed absent to `{ kind: 'createIfAbsent' }` and observed present to `{ kind: 'replaceIfVersion', version: vObserved }`. `fs/edit-intent` rejects an unseen target with `FS_NOT_OBSERVED`, a confirmed-absent target with `FS_NOT_FOUND`, and otherwise supplies the observed version as the compare-and-swap basis. `fs/observed` records `{ kind: 'present', version }` or `{ kind: 'absent' }` for the owner and target — a synchronous, side-effect-only `WeakMap.set`, because successful mutations have already committed.
+`fs/write-intent` resolves unseen or confirmed absent to `{ kind: 'createIfAbsent' }` and observed present to `{ kind: 'replaceIfVersion', version: vObserved }`. `fs/edit-intent` rejects an unseen target with `FS_NOT_OBSERVED`, a confirmed-absent target with `FS_NOT_FOUND`, and otherwise supplies the observed version as the compare-and-swap basis. `fs/observed` records `{ kind: 'present', version }` or `{ kind: 'absent' }` for the owner and target — a synchronous, side-effect-only `WeakMap.set`, because successful mutations have already committed. On `session/created`, the plugin replays `meta.fsObservation` records from persisted tool results into the restored Session without reading the current file.
 
 ### Single-slot, first-wins
 
@@ -79,7 +79,7 @@ Each intent slot holds exactly one decider: this plugin fully decides and never 
 
 ### Lifecycle
 
-Observed state is dropped on plugin disposal (HMR safety) and is never persisted across sessions — a resumed session starts with no observations.
+Observed state is dropped on plugin disposal (HMR safety). A restored Session rebuilds it from persisted result metadata before agent work resumes.
 
 </details>
 
@@ -123,7 +123,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 These limits define when the policy is a poor fit or needs special operational care. They are current package constraints, not a general filesystem comparison or a task backlog.
 
-- **Observed state does not survive a session resume** — persistence of the record is deferred, so a resumed session must re-read files before guarded writes and edits.
+- **Only observations recorded in result metadata survive a rebuild** — a producer that does not attach `meta.fsObservation` leaves no restorable record, so its targets must be read again.
 - **Actors without an agent session can never satisfy the policy** — their edits throw `FS_NOT_OBSERVED` and their writes always resolve `createIfAbsent`, so a non-agent caller cannot overwrite an existing file through the gate.
 - **Direct `ctx.fs` reads emit no `fs/observed`** — a file read outside the `read` tool stays unobserved, and a later guarded edit rejects with `FS_NOT_OBSERVED` until the tool reads it.
 - **Authorization is version freshness, not view completeness** — any windowed read authorizes a full-file overwrite of an unchanged file, deliberately weaker than a full-view rule ([seam-split reference](../fs/README.md)).

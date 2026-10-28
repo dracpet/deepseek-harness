@@ -13,7 +13,7 @@ Use the read tool — not shell commands like cat — to inspect text files. Use
 
 Read an existing file before overwriting it with write (the default fs-observation-policy requires it) and prefer edit for targeted changes.
 
-Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.
+Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session. For multi-hunk or staleness-prone edits, read with `line_ids=true` and edit with `ops` (id-addressed, hash-guarded); the reply carries a renumber map so chained edits skip the re-read.
 
 Use the glob tool — not shell find — to discover files by path pattern.
 
@@ -128,16 +128,26 @@ interface ToolArgsMap {
   } & Record<string, JsonValue>;
   /** Inspect applications through the CUA object runtime. */
   cua: unknown;
-  /** Edit an existing UTF-8 text file by replacing literal text. */
+  /** Edit an existing UTF-8 text file by replacing literal text, or by id-addressed `ops` against a `line_ids` read. */
   edit: {
     /** Path to edit, resolved by the filesystem backend. Provide `file_path` before `old_string` and `new_string` in the arguments. */
     file_path: string;
-    /** Literal text to replace. */
-    old_string: string;
+    /** Literal text to replace. Required unless `ops` is given. */
+    old_string?: string;
     /** Literal replacement text. Use an empty string to delete the match. */
-    new_string: string;
+    new_string?: string;
     /** Replace all matches. Defaults to false; when false, old_string must appear exactly once. */
     replace_all?: boolean;
+    /** Id-addressed ops against a `line_ids` read (mutually exclusive with old_string/new_string). Each op: `{op, id, end_id?, text?}` with op in replace | insert_before | insert_after | delete; `id` = `N#hash` anchor (span end `end_id` inclusive, replace/delete only; `text` required except delete). Hash is the address — a moved line self-locates, a changed line refuses with its current hash. The reply carries a renumber map and fresh ids for inserted lines. */
+    ops?: ({
+      op: "replace" | "insert_before" | "insert_after" | "delete";
+      /** Anchor line id `N#hash` from a `line_ids` read. */
+      id: string;
+      /** Inclusive span end id (replace/delete only). */
+      end_id?: string;
+      /** Replacement or inserted text (required except delete). */
+      text?: string;
+    })[];
     /** The narrowest wider sandbox mode for a one-shot retry of the exact operation the sandbox just denied; the retry asks the user for approval. */
     sandbox_permissions?: "workspace-write" | "danger-full-access";
     /** Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access. Use the language of the user’s current request. */
@@ -189,7 +199,7 @@ interface ToolArgsMap {
     /** children (default) lists direct children, which accept send_message in any status. descendants lists the whole tree below you with each entry's parent session id and depth; entries deeper than 1 accept only interrupt_agent. */
     scope?: "children" | "descendants";
   } & Record<string, JsonValue>;
-  /** Read a UTF-8 text file and return line-numbered content. */
+  /** Read a UTF-8 text file and return line-numbered content (`line_ids=true` mints edit-addressable `N#hash` ids). */
   read: {
     /** Path to read, resolved by the filesystem backend. */
     file_path: string;
@@ -197,6 +207,8 @@ interface ToolArgsMap {
     offset?: number;
     /** Maximum number of lines to return. Defaults to 2000. */
     limit?: number;
+    /** Mint a `N#hash` id per line and wrap over-long lines into exact-join `>` segments (a `!` line declares a tail beyond the per-line cap). Use when you will edit with `ops`. */
+    line_ids?: boolean;
   } & Record<string, JsonValue>;
   /** Read a PNG/JPEG/WebP/GIF file and return the image itself. Large images are downscaled automatically; do not install image libraries or create thumbnails to inspect an image. */
   read_image: {
@@ -377,8 +389,43 @@ interface ToolOutputMap {
   edit: {
     /** Canonical absolute path in the filesystem execution world. */
     path: string;
-    before: string;
+    before: string | null;
     after: string;
+    fsObservation: {
+      target?: {
+        targetKey: string;
+        displayPath: string;
+      };
+      observation?: {
+        kind: "present";
+        version: string;
+      };
+    };
+    /** Present for ops-mode edits (write path). */
+    operation?: "create" | "update";
+    /** Renumber report, present for ops-mode edits. */
+    idEdit?: {
+      applied: number;
+      renumber: {
+        oldStart: number;
+        oldEnd: number;
+        /** Absent (with newEnd) when the range was deleted. */
+        newStart?: number;
+        newEnd?: number;
+      }[];
+      inserted: {
+        newStart: number;
+        count: number;
+        /** Id of the block's first line, for chained edits. */
+        firstId?: string;
+      }[];
+      replaced: {
+        newStart: number;
+        count: number;
+        /** Id of the block's first line, for chained edits. */
+        firstId?: string;
+      }[];
+    };
   };
   get_goal: {
     goal: null;
@@ -465,8 +512,24 @@ interface ToolOutputMap {
     lines: {
       number: number;
       text: string;
+      /** Line id `N#hash`, present in `line_ids` mode. */
+      id?: string;
+      /** The line continues on the next entry (exact-join). */
+      continued?: boolean;
+      /** Hidden tail chars beyond the per-line cap. */
+      lineTruncated?: number;
     }[];
     totalLines: number;
+    fsObservation: {
+      target?: {
+        targetKey: string;
+        displayPath: string;
+      };
+      observation?: {
+        kind: "present";
+        version: string;
+      };
+    };
   };
   read_image: {
     /** Canonical absolute path in the filesystem execution world. */
@@ -481,6 +544,16 @@ interface ToolOutputMap {
       originalDimensions?: {
         width: number;
         height: number;
+      };
+    };
+    fsObservation: {
+      target?: {
+        targetKey: string;
+        displayPath: string;
+      };
+      observation?: {
+        kind: "present";
+        version: string;
       };
     };
   };
@@ -582,6 +655,16 @@ interface ToolOutputMap {
     operation: "create" | "update";
     before: string | null;
     after: string;
+    fsObservation: {
+      target?: {
+        targetKey: string;
+        displayPath: string;
+      };
+      observation?: {
+        kind: "present";
+        version: string;
+      };
+    };
   };
 }
 

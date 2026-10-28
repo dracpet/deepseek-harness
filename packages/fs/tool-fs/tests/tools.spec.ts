@@ -41,6 +41,14 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 
 const testToolSignal = new AbortController().signal
 
+/** Exact durable observation expected beside a successful fake-provider result. */
+const observed = (displayPath: string, version: string, targetKey = `key:${displayPath.split('/').at(-1)}`) => ({
+  fsObservation: {
+    target: { targetKey, displayPath },
+    observation: { kind: 'present', version },
+  },
+})
+
 /** An in-memory fake provider; a test can arm a rejection on any primitive. */
 class FakeFs extends FileSystem {
   override watch(): never { throw new Error('Fixture does not support watching') }
@@ -181,15 +189,17 @@ describe('registration', () => {
   })
 
   it.each([
-    { name: 'write', fields: ['content'], hint: 'Provide `file_path` before `content` in the arguments.' },
-    { name: 'edit', fields: ['old_string', 'new_string'], hint: 'Provide `file_path` before `old_string` and `new_string` in the arguments.' },
-  ])('requests file_path before content fields for $name', async ({ name, fields, hint }) => {
+    { name: 'write', fields: ['content'], hint: 'Provide `file_path` before `content` in the arguments.', required: ['file_path', 'content'] },
+    // upstream-tool-fs-line-ids: ops mode made the literal pair optional at the
+    // schema level (the mode rule is enforced by parseEditArgs at runtime).
+    { name: 'edit', fields: ['old_string', 'new_string'], hint: 'Provide `file_path` before `old_string` and `new_string` in the arguments.', required: ['file_path'] },
+  ])('requests file_path before content fields for $name', async ({ name, fields, hint, required }) => {
     const { ctx } = await setup()
     try {
       const schema = ctx.tools.schemas().find(tool => tool.name === name)!
       expect(Object.keys(schema.parameters.properties as Record<string, unknown>).slice(0, fields.length + 1))
         .toEqual(['file_path', ...fields])
-      expect(schema.parameters).toHaveProperty('required', ['file_path', ...fields])
+      expect(schema.parameters).toHaveProperty('required', required)
       expect(schema.parameters).toHaveProperty('properties.file_path.description', expect.stringContaining(hint))
     } finally {
       await ctx.fiber.dispose()
@@ -257,6 +267,7 @@ describe('read tool', () => {
       offset: 1,
       lines: [{ number: 1, text: 'hello' }, { number: 2, text: 'world' }],
       totalLines: 2,
+      ...observed('/abs/a.txt', 'v1'),
     })
     expect(text(result)).toBe(`<path>/abs/a.txt</path>
 <type>file</type>
@@ -273,7 +284,7 @@ describe('read tool', () => {
     fs.files.set('key:empty.txt', '')
     const result = await call(ctx, 'read', { file_path: 'empty.txt' })
     if (result.isError) throw new Error('expected empty read success')
-    expect(result.value).toEqual({ path: '/abs/empty.txt', offset: 1, lines: [], totalLines: 0 })
+    expect(result.value).toEqual({ path: '/abs/empty.txt', offset: 1, lines: [], totalLines: 0, ...observed('/abs/empty.txt', 'v1') })
     expect(text(result)).toContain('(End of file - total 0 lines)')
   })
 
@@ -389,6 +400,7 @@ describe('read tool', () => {
       lines: [{ number: 1, text: 'const x = 1' }, { number: 2, text: 'const y = 2' }],
       totalLines: 2,
       lang: 'ts',
+      ...observed('/abs/a.ts', 'v1'),
     })
     const view = ctx.tools.get('read')?.presentResult?.({ file_path: 'a.ts' }, result)
     expect(view).toEqual({
@@ -407,7 +419,7 @@ describe('read tool', () => {
     fs.files.set('key:notes', 'plain')
     const result = await call(ctx, 'read', { file_path: 'notes' })
     if (result.isError) throw new Error('expected read success')
-    expect(result.meta).toEqual({ path: '/abs/notes', offset: 1, lines: [{ number: 1, text: 'plain' }], totalLines: 1 })
+    expect(result.meta).toEqual({ path: '/abs/notes', offset: 1, lines: [{ number: 1, text: 'plain' }], totalLines: 1, ...observed('/abs/notes', 'v1') })
   })
 })
 
@@ -441,7 +453,7 @@ describe('write tool', () => {
     const result = await call(ctx, 'write', { file_path: 'a.txt', content: 'hi' }, { session: { header: {} } })
     expect(result.isError).toBe(false)
     if (result.isError) throw new Error('expected write success')
-    expect(result.value).toEqual({ path: '/abs/a.txt', operation: 'create', before: null, after: 'hi' })
+    expect(result.value).toEqual({ path: '/abs/a.txt', operation: 'create', before: null, after: 'hi', ...observed('/abs/a.txt', 'v2') })
     expect(text(result)).toContain('Created file')
     expect(fs.writeIntents).toEqual([{ kind: 'createIfAbsent' }])
   })
@@ -471,7 +483,7 @@ describe('edit tool', () => {
     await call(ctx, 'read', { file_path: 'a.txt' }, { session })
     const result = await call(ctx, 'edit', { file_path: 'a.txt', old_string: 'a', new_string: 'b' }, { session })
     if (result.isError) throw new Error('expected edit success')
-    expect(result.value).toEqual({ path: '/abs/a.txt', before: 'a', after: 'b' })
+    expect(result.value).toEqual({ path: '/abs/a.txt', before: 'a', after: 'b', ...observed('/abs/a.txt', 'v3') })
     expect(text(result)).toBe('The file /abs/a.txt has been updated successfully.')
   })
 
@@ -511,6 +523,100 @@ describe('edit tool', () => {
     const result = await call(ctx, 'edit', { file_path: 'a.txt', old_string: 'a', new_string: 'b' }, { session: { header: {} } })
     expect(result.isError).toBe(true)
     expect(result.error).toMatchObject({ info: { code: 'FS_NOT_OBSERVED' } })
+  })
+})
+
+describe('edit ops mode (id-addressed, upstream-tool-fs-line-ids)', () => {
+  const agent = { session: { header: {} } }
+
+  const readWithIds = async (ctx: Context, path: string): Promise<string[]> => {
+    const result = await call(ctx, 'read', { file_path: path, line_ids: true }, agent)
+    expect(result.isError).toBe(false)
+    const body = text(result)
+    return [...body.matchAll(/(\d+#[0-9a-f]{8})\|/g)].map(match => match[1]!)
+  }
+
+  it('edits by id through the gate after a line_ids read, and reports renumber', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'alpha\nbravo\ncharlie\n')
+    const ids = await readWithIds(ctx, 'a.txt')
+    expect(ids).toHaveLength(3)
+
+    const result = await call(ctx, 'edit', {
+      file_path: 'a.txt',
+      ops: [{ op: 'replace', id: ids[1], text: 'BRAVO' }],
+    }, agent)
+    expect(result.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('alpha\nBRAVO\ncharlie\n')
+    expect(text(result)).toContain('1 op applied')
+    expect(text(result)).toContain('replaced: 1 line at 2 (first id 2#')
+    // The write path carried the gate's CAS basis.
+    expect(fs.writeIntents.at(-1)).toEqual({ kind: 'replaceIfVersion', version: FsVersion('v1') })
+  })
+
+  it('refuses an unread target through the gate, then self-heals like literal mode', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'alpha\n')
+    const result = await call(ctx, 'edit', {
+      file_path: 'a.txt',
+      ops: [{ op: 'replace', id: `1#${'0'.repeat(8)}`, text: 'x' }],
+    }, agent)
+    expect(result.isError).toBe(true)
+    expect(result.error).toMatchObject({ info: { code: 'FS_NOT_OBSERVED' } })
+    // The recovery registered the observation — a retry with fresh ids passes the gate.
+    const ids = await readWithIds(ctx, 'a.txt')
+    const retry = await call(ctx, 'edit', { file_path: 'a.txt', ops: [{ op: 'replace', id: ids[0], text: 'ALPHA' }] }, agent)
+    expect(retry.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('ALPHA\n')
+  })
+
+  it('refuses a stale id with an actionable message naming the current hash', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'alpha\nbravo\n')
+    const ids = await readWithIds(ctx, 'a.txt')
+    // A bash-lane write (no observation) changes the file after the read.
+    fs.files.set('key:a.txt', 'alpha\nCHANGED\n')
+    const result = await call(ctx, 'edit', { file_path: 'a.txt', ops: [{ op: 'replace', id: ids[1], text: 'x' }] }, agent)
+    expect(result.isError).toBe(true)
+    expect(text(result)).toMatch(/no line carries hash .* Line 2 is now "CHANGED"/)
+  })
+
+  it('chains a second ops edit without a re-read (renumber keeps addressing)', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'alpha\nbravo\ncharlie\n')
+    const ids = await readWithIds(ctx, 'a.txt')
+    const first = await call(ctx, 'edit', {
+      file_path: 'a.txt',
+      ops: [{ op: 'delete', id: ids[1] }],
+    }, agent)
+    expect(first.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('alpha\ncharlie\n')
+    // charlie was line 3, is now line 2; its hash self-locates it.
+    const second = await call(ctx, 'edit', {
+      file_path: 'a.txt',
+      ops: [{ op: 'replace', id: ids[2], text: 'CHARLIE' }],
+    }, agent)
+    expect(second.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('alpha\nCHARLIE\n')
+  })
+
+  it('rejects mixing ops with the literal pair', async () => {
+    const { ctx } = await setup()
+    const result = await call(ctx, 'edit', {
+      file_path: 'a.txt', old_string: 'a', new_string: 'b', ops: [{ op: 'delete', id: '1#abcdef12' }],
+    }, agent)
+    expect(result.isError).toBe(true)
+    expect(text(result)).toContain('pick one mode')
+  })
+
+  it('keeps the literal mode untouched when ops is absent (regression)', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'hello world')
+    await call(ctx, 'read', { file_path: 'a.txt' }, agent)
+    const result = await call(ctx, 'edit', { file_path: 'a.txt', old_string: 'world', new_string: 'there' }, agent)
+    expect(result.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('hello there')
+    expect(fs.editIntents).toHaveLength(1)
   })
 })
 
@@ -674,6 +780,7 @@ describe('result-time contextual diff (meta + presentResult)', () => {
     expect(result.meta).toEqual({
       path: '/abs/a.txt',
       diffs: [{ path: '/abs/a.txt', oldText: 'a\nb\nc\nOLD\nd\ne\nf', newText: 'a\nb\nc\nNEW\nd\ne\nf' }],
+      ...observed('/abs/a.txt', 'v3'),
     })
   })
 
@@ -697,7 +804,7 @@ describe('result-time contextual diff (meta + presentResult)', () => {
     await call(ctx, 'read', { file_path: 'a.txt' }, { session })
     const result = await call(ctx, 'write', { file_path: 'a.txt', content: 'a\nb\nc\nNEW\nd\ne\nf\n' }, { session })
     expect(result.isError).toBe(false)
-    expect(result.meta).toEqual({ operation: 'update', path: '/abs/a.txt', diffs: [{ path: '/abs/a.txt', oldText: 'a\nb\nc\nOLD\nd\ne\nf', newText: 'a\nb\nc\nNEW\nd\ne\nf' }] })
+    expect(result.meta).toEqual({ operation: 'update', path: '/abs/a.txt', diffs: [{ path: '/abs/a.txt', oldText: 'a\nb\nc\nOLD\nd\ne\nf', newText: 'a\nb\nc\nNEW\nd\ne\nf' }], ...observed('/abs/a.txt', 'v2') })
     const view = ctx.tools.get('write')?.presentResult?.({ file_path: 'a.txt', content: 'x' }, result)
     expect(view).toEqual({ card: 'diff', title: 'Write a.txt', diffs: [{ path: '/abs/a.txt', oldText: 'a\nb\nc\nOLD\nd\ne\nf', newText: 'a\nb\nc\nNEW\nd\ne\nf' }] })
   })
@@ -709,7 +816,7 @@ describe('result-time contextual diff (meta + presentResult)', () => {
     const session = { header: {} }
     const result = await call(ctx, 'write', { file_path: 'new.txt', content: 'fresh\n' }, { session })
     expect(result.isError).toBe(false)
-    expect(result.meta).toEqual({ operation: 'create', path: '/abs/new.txt', diffs: [] })
+    expect(result.meta).toEqual({ operation: 'create', path: '/abs/new.txt', diffs: [], ...observed('/abs/new.txt', 'v2') })
     const view = ctx.tools.get('write')?.presentResult?.({ file_path: 'new.txt', content: 'fresh\n' }, result)
     expect(view).toEqual({ card: 'diff', title: 'Write new.txt', diffs: [{ path: '/abs/new.txt', oldText: null, newText: 'fresh\n' }] })
   })
@@ -722,7 +829,7 @@ describe('result-time contextual diff (meta + presentResult)', () => {
     const result = await call(ctx, 'write', { file_path: 'a.txt', content: 'same\n' }, { session })
     expect(result.isError).toBe(false)
     // The operation lets a consumer tell this unchanged overwrite from a create with the same empty hunk list.
-    expect(result.meta).toEqual({ operation: 'update', path: '/abs/a.txt', diffs: [] })
+    expect(result.meta).toEqual({ operation: 'update', path: '/abs/a.txt', diffs: [], ...observed('/abs/a.txt', 'v2') })
     const view = ctx.tools.get('write')?.presentResult?.({ file_path: 'a.txt', content: 'same\n' }, result)
     expect(view).toEqual({ card: 'diff', title: 'Write a.txt', diffs: [{ path: '/abs/a.txt', oldText: null, newText: 'same\n' }] })
   })
@@ -1151,7 +1258,9 @@ async function guidanceScope(ctx: Context) {
 const originalGuidance = {
   read: 'Use the read tool — not shell commands like cat — to inspect text files. Use offset and limit to continue reading large files.',
   write: 'Read an existing file before overwriting it with write (the default fs-observation-policy requires it) and prefer edit for targeted changes.',
-  edit: 'Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.',
+  // upstream-tool-fs-line-ids: the edit guidance gained the ops-mode sentence.
+  edit: 'Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.'
+    + ' For multi-hunk or staleness-prone edits, read with `line_ids=true` and edit with `ops` (id-addressed, hash-guarded); the reply carries a renumber map so chained edits skip the re-read.',
 }
 
 describe('scope-aware filesystem guidance', () => {

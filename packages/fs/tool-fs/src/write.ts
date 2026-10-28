@@ -11,8 +11,8 @@ import type { DiffCallView, DiffResultView, ToolResult } from '@deepseek-ai/dsh-
 import type { FsWriteOutcome } from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-fs'
 import { computeHunkDiffs, diffsFromMeta, pathFromMeta } from './diff.ts'
-import { remediateFsError } from './error.ts'
-import { mutationResult } from './mutation-result.ts'
+import { explainMutationFailure } from './recovery.ts'
+import { FS_OBSERVATION_RESULT_SCHEMA, mutationResult } from './mutation-result.ts'
 import { sessionResolveOptions } from './session-cwd.ts'
 import type { FsSandboxController } from './sandbox.ts'
 
@@ -97,12 +97,14 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController): void
             ],
           },
           after: { type: 'string', required: true },
+          fsObservation: FS_OBSERVATION_RESULT_SCHEMA,
         },
       },
       render: (_args, value) => [{ type: 'text', text: formatWriteOutput(value.path, value) }],
       presentationMeta: (_args, value) => ({
         operation: value.operation,
         path: value.path,
+        fsObservation: value.fsObservation,
         diffs: value.before === null
           ? []
           : computeHunkDiffs(value.path, value.before, value.after)
@@ -125,8 +127,10 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController): void
       } catch (error: unknown) {
         // A sandbox denial becomes the shared [sandbox: …] marker (the model
         // recognizes it from bash); guarded mutation failures receive their
-        // stable model-facing diagnostic; anything else passes through.
-        throw remediateFsError(sandbox.mapError(error, sandboxPolicy), target.displayPath)
+        // stable model-facing diagnostic; anything else passes through. The two
+        // bookkeeping refusals (unread target / moved version) additionally carry
+        // the current content, so the retry needs no separate read.
+        throw await explainMutationFailure(ctx, exec, target, sandbox.mapError(error, sandboxPolicy))
       }
       return mutationResult(ctx, target, outcome, exec)
     },

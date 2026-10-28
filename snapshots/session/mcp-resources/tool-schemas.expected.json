@@ -67,7 +67,7 @@
     },
     {
       "name": "edit",
-      "description": "Edit an existing UTF-8 text file by replacing literal text.",
+      "description": "Edit an existing UTF-8 text file by replacing literal text, or by id-addressed `ops` against a `line_ids` read.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -77,7 +77,7 @@
           },
           "old_string": {
             "type": "string",
-            "description": "Literal text to replace."
+            "description": "Literal text to replace. Required unless `ops` is given."
           },
           "new_string": {
             "type": "string",
@@ -86,6 +86,41 @@
           "replace_all": {
             "type": "boolean",
             "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once."
+          },
+          "ops": {
+            "type": "array",
+            "description": "Id-addressed ops against a `line_ids` read (mutually exclusive with old_string/new_string). Each op: `{op, id, end_id?, text?}` with op in replace | insert_before | insert_after | delete; `id` = `N#hash` anchor (span end `end_id` inclusive, replace/delete only; `text` required except delete). Hash is the address — a moved line self-locates, a changed line refuses with its current hash. The reply carries a renumber map and fresh ids for inserted lines.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "replace",
+                    "insert_before",
+                    "insert_after",
+                    "delete"
+                  ]
+                },
+                "id": {
+                  "type": "string",
+                  "description": "Anchor line id `N#hash` from a `line_ids` read."
+                },
+                "end_id": {
+                  "type": "string",
+                  "description": "Inclusive span end id (replace/delete only)."
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Replacement or inserted text (required except delete)."
+                }
+              },
+              "required": [
+                "op",
+                "id"
+              ]
+            }
           },
           "sandbox_permissions": {
             "type": "string",
@@ -101,9 +136,7 @@
           }
         },
         "required": [
-          "file_path",
-          "old_string",
-          "new_string"
+          "file_path"
         ]
       }
     },
@@ -286,7 +319,7 @@
     },
     {
       "name": "read",
-      "description": "Read a UTF-8 text file and return line-numbered content.",
+      "description": "Read a UTF-8 text file and return line-numbered content (`line_ids=true` mints edit-addressable `N#hash` ids).",
       "parameters": {
         "type": "object",
         "properties": {
@@ -301,6 +334,10 @@
           "limit": {
             "type": "number",
             "description": "Maximum number of lines to return. Defaults to 2000."
+          },
+          "line_ids": {
+            "type": "boolean",
+            "description": "Mint a `N#hash` id per line and wrap over-long lines into exact-join `>` segments (a `!` line declares a tail beyond the per-line cap). Use when you will edit with `ops`."
           }
         },
         "required": [

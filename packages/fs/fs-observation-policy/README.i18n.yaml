@@ -9,8 +9,8 @@
   en: 7fddbb6d5b42812b
   zh: 2894feecfbdcc099
 /deepseek-ai-dsh-fs-observation-policy/summary:
-  en: e74517566c1827b2
-  zh: 803c6ddf5cbd3842
+  en: ab81df94875058fb
+  zh: e75e9b2ba81a09ae
 /deepseek-ai-dsh-fs-observation-policy/table-of-contents:
   en: d152484eb41ac6b4
   zh: 09388d293f9be9cb
@@ -21,8 +21,8 @@
   en: d85e3b814b43768e
   zh: 89d3672dbb2f6d30
 /deepseek-ai-dsh-fs-observation-policy/use-this-package/what-changes-for-the-model:
-  en: 91686925a433794d
-  zh: 9ac2a197203d6549
+  en: dc7a05e68928020e
+  zh: 38c35e474515ac75
 /deepseek-ai-dsh-fs-observation-policy/use-this-package/failures-and-recovery:
   en: 1ecc7b68f7c7b3f0
   zh: f6a9800786ed30c0
@@ -30,20 +30,20 @@
   en: 612e69f76edc8795
   zh: 55edab9956941616
 /deepseek-ai-dsh-fs-observation-policy/understand-the-implementation/design-concept:
-  en: 54eef802ac087112
-  zh: f30b2ed5dbc268ac
+  en: 21fa9c9cfd972b5b
+  zh: dac7d60d5d79ebbd
 /deepseek-ai-dsh-fs-observation-policy/understand-the-implementation/source-map:
-  en: 6a55bd72a91664bf
-  zh: fc22345acfd9d850
+  en: 6ec08b96b8504dc7
+  zh: 4446aeb0a07d9167
 /deepseek-ai-dsh-fs-observation-policy/understand-the-implementation/decision-flow:
-  en: 79ddd675e3c27d62
-  zh: b9b74b63aad5b42d
+  en: 75ae7f35a3a3edb8
+  zh: e921ecd7bf3fdc02
 /deepseek-ai-dsh-fs-observation-policy/understand-the-implementation/single-slot-first-wins:
   en: 226bb7885eb147b8
   zh: 0b68d59ddc55fb07
 /deepseek-ai-dsh-fs-observation-policy/understand-the-implementation/lifecycle:
-  en: 02a1e3e7707706fb
-  zh: eff587af0445d032
+  en: 98a517d65ee5a91a
+  zh: daf18ce4eb895d48
 /deepseek-ai-dsh-fs-observation-policy/further-exploration:
   en: c89ef001db3d1efe
   zh: 382165321299c86c
@@ -63,8 +63,8 @@
   en: 2fbf2175168e8244
   zh: 3d6bc05b9eadfbc2
 /deepseek-ai-dsh-fs-observation-policy/known-limitations-and-deferred-work:
-  en: 2a9237f283f57b96
-  zh: fbd53b396d3076fa
+  en: e600bb40eb1d82b7
+  zh: 73c4948f879fdf38
 /deepseek-ai-dsh-fs-observation-policy/known-limitations-and-deferred-work/dev-note:
   en: e67f633dc6fe7773
   zh: 3bb0c20c93f16f98

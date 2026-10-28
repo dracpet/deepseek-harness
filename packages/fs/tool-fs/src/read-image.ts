@@ -20,6 +20,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-fs'
 import { resolveRegularReadTarget } from './read-target.ts'
+import { FS_OBSERVATION_RESULT_SCHEMA, observationResult } from './mutation-result.ts'
 
 /** Extensions `read_image` accepts; magic-byte validation at the attachment service stays authoritative. */
 const IMAGE_EXTENSIONS: Readonly<Record<string, ImageMediaType>> = {
@@ -221,6 +222,7 @@ export function applyReadImageTool(ctx: Context): void {
         properties: {
           path: { type: 'string', required: true, description: 'Canonical absolute path in the filesystem execution world.' },
           image: IMAGE_VALUE_SCHEMA,
+          fsObservation: FS_OBSERVATION_RESULT_SCHEMA,
         },
       },
       render: (_args, value) => imageReadContent(value),
@@ -232,7 +234,7 @@ export function applyReadImageTool(ctx: Context): void {
       // returns. The path needs its own structured record because the content
       // carries it only as model-facing envelope text, which the client does not
       // parse.
-      presentationMeta: (_args, value) => ({ path: value.path }),
+      presentationMeta: (_args, value) => ({ path: value.path, fsObservation: value.fsObservation }),
     },
     // Content-addressed attachment writes are idempotent, so concurrent reads
     // of the same file cannot conflict.
@@ -334,7 +336,7 @@ export function applyReadImageTool(ctx: Context): void {
           },
         },
       }
-      return value
+      return { ...value, ...observationResult(target, { kind: 'present', version: info.version }) }
     },
     // Pure display: a generic card in the read family with a follow-along
     // location on the image file.

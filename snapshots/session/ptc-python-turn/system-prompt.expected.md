@@ -13,7 +13,7 @@ Use the read tool — not shell commands like cat — to inspect text files. Use
 
 Read an existing file before overwriting it with write (the default fs-observation-policy requires it) and prefer edit for targeted changes.
 
-Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.
+Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session. For multi-hunk or staleness-prone edits, read with `line_ids=true` and edit with `ops` (id-addressed, hash-guarded); the reply carries a renumber map so chained edits skip the re-read.
 
 Use the glob tool — not shell find — to discover files by path pattern.
 
@@ -131,26 +131,79 @@ class CreateGoalOutput2(TypedDict):
     goal: CreateGoalOutput2Goal
     activation: Literal["armed", "disarmed"]
 
+class EditArgsOps(TypedDict):
+    op: Literal["replace", "insert_before", "insert_after", "delete"]
+    # Anchor line id `N#hash` from a `line_ids` read.
+    id: str
+    # Inclusive span end id (replace/delete only).
+    end_id: NotRequired[str]
+    # Replacement or inserted text (required except delete).
+    text: NotRequired[str]
+
 class EditArgs(TypedDict):
     # Path to edit, resolved by the filesystem backend. Provide `file_path` before `old_string` and `new_string` in the arguments.
     file_path: str
-    # Literal text to replace.
-    old_string: str
+    # Literal text to replace. Required unless `ops` is given.
+    old_string: NotRequired[str]
     # Literal replacement text. Use an empty string to delete the match.
-    new_string: str
+    new_string: NotRequired[str]
     # Replace all matches. Defaults to false; when false, old_string must appear exactly once.
     replace_all: NotRequired[bool]
+    # Id-addressed ops against a `line_ids` read (mutually exclusive with old_string/new_string). Each op: `{op, id, end_id?, text?}` with op in replace | insert_before | insert_after | delete; `id` = `N#hash` anchor (span end `end_id` inclusive, replace/delete only; `text` required except delete). Hash is the address — a moved line self-locates, a changed line refuses with its current hash. The reply carries a renumber map and fresh ids for inserted lines.
+    ops: NotRequired[list[EditArgsOps]]
     # The narrowest wider sandbox mode for a one-shot retry of the exact operation the sandbox just denied; the retry asks the user for approval.
     sandbox_permissions: NotRequired[Literal["workspace-write", "danger-full-access"]]
     # Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access. Use the language of the user’s current request.
     justification: NotRequired[str]
     # Additional keys beyond those declared are allowed.
 
+class EditOutputFsObservationTarget(TypedDict):
+    targetKey: str
+    displayPath: str
+
+class EditOutputFsObservationObservation(TypedDict):
+    kind: Literal["present"]
+    version: str
+
+class EditOutputFsObservation(TypedDict):
+    target: NotRequired[EditOutputFsObservationTarget]
+    observation: NotRequired[EditOutputFsObservationObservation]
+
+class EditOutputIdEditRenumber(TypedDict):
+    oldStart: int
+    oldEnd: int
+    # Absent (with newEnd) when the range was deleted.
+    newStart: NotRequired[int]
+    newEnd: NotRequired[int]
+
+class EditOutputIdEditInserted(TypedDict):
+    newStart: int
+    count: int
+    # Id of the block's first line, for chained edits.
+    firstId: NotRequired[str]
+
+class EditOutputIdEditReplaced(TypedDict):
+    newStart: int
+    count: int
+    # Id of the block's first line, for chained edits.
+    firstId: NotRequired[str]
+
+class EditOutputIdEdit(TypedDict):
+    applied: int
+    renumber: list[EditOutputIdEditRenumber]
+    inserted: list[EditOutputIdEditInserted]
+    replaced: list[EditOutputIdEditReplaced]
+
 class EditOutput(TypedDict):
     # Canonical absolute path in the filesystem execution world.
     path: str
-    before: str
+    before: str | None
     after: str
+    fsObservation: EditOutputFsObservation
+    # Present for ops-mode edits (write path).
+    operation: NotRequired[Literal["create", "update"]]
+    # Renumber report, present for ops-mode edits.
+    idEdit: NotRequired[EditOutputIdEdit]
 
 class GetGoalOutput1(TypedDict):
     goal: None
@@ -286,11 +339,31 @@ class ReadArgs(TypedDict):
     offset: NotRequired[float]
     # Maximum number of lines to return. Defaults to 2000.
     limit: NotRequired[float]
+    # Mint a `N#hash` id per line and wrap over-long lines into exact-join `>` segments (a `!` line declares a tail beyond the per-line cap). Use when you will edit with `ops`.
+    line_ids: NotRequired[bool]
     # Additional keys beyond those declared are allowed.
 
 class ReadOutputLines(TypedDict):
     number: int
     text: str
+    # Line id `N#hash`, present in `line_ids` mode.
+    id: NotRequired[str]
+    # The line continues on the next entry (exact-join).
+    continued: NotRequired[bool]
+    # Hidden tail chars beyond the per-line cap.
+    lineTruncated: NotRequired[int]
+
+class ReadOutputFsObservationTarget(TypedDict):
+    targetKey: str
+    displayPath: str
+
+class ReadOutputFsObservationObservation(TypedDict):
+    kind: Literal["present"]
+    version: str
+
+class ReadOutputFsObservation(TypedDict):
+    target: NotRequired[ReadOutputFsObservationTarget]
+    observation: NotRequired[ReadOutputFsObservationObservation]
 
 class ReadOutput(TypedDict):
     # Canonical absolute path in the filesystem execution world.
@@ -298,6 +371,7 @@ class ReadOutput(TypedDict):
     offset: int
     lines: list[ReadOutputLines]
     totalLines: int
+    fsObservation: ReadOutputFsObservation
 
 class ReadImageArgs(TypedDict):
     # Path to the image file, resolved by the filesystem backend.
@@ -317,10 +391,23 @@ class ReadImageOutputImage(TypedDict):
     name: NotRequired[str]
     originalDimensions: NotRequired[ReadImageOutputImageOriginalDimensions]
 
+class ReadImageOutputFsObservationTarget(TypedDict):
+    targetKey: str
+    displayPath: str
+
+class ReadImageOutputFsObservationObservation(TypedDict):
+    kind: Literal["present"]
+    version: str
+
+class ReadImageOutputFsObservation(TypedDict):
+    target: NotRequired[ReadImageOutputFsObservationTarget]
+    observation: NotRequired[ReadImageOutputFsObservationObservation]
+
 class ReadImageOutput(TypedDict):
     # Canonical absolute path in the filesystem execution world.
     path: str
     image: ReadImageOutputImage
+    fsObservation: ReadImageOutputFsObservation
 
 class SendMessageArgs(TypedDict):
     # The agent id of your direct continuable child, or your direct parent when you are a resident continuable child.
@@ -496,12 +583,25 @@ class WriteArgs(TypedDict):
     justification: NotRequired[str]
     # Additional keys beyond those declared are allowed.
 
+class WriteOutputFsObservationTarget(TypedDict):
+    targetKey: str
+    displayPath: str
+
+class WriteOutputFsObservationObservation(TypedDict):
+    kind: Literal["present"]
+    version: str
+
+class WriteOutputFsObservation(TypedDict):
+    target: NotRequired[WriteOutputFsObservationTarget]
+    observation: NotRequired[WriteOutputFsObservationObservation]
+
 class WriteOutput(TypedDict):
     # Canonical absolute path in the filesystem execution world.
     path: str
     operation: Literal["create", "update"]
     before: str | None
     after: str
+    fsObservation: WriteOutputFsObservation
 
 class Tools(Protocol):
     async def bash(self, args: BashArgs) -> BashOutput1 | BashOutput2 | BashOutput3:
@@ -509,7 +609,7 @@ class Tools(Protocol):
     async def create_goal(self, args: CreateGoalArgs) -> CreateGoalOutput1 | CreateGoalOutput2:
         """Create a persisted goal that keeps this session working across automatic continuation rounds. Use it when the direct human request is a long-running objective, even if the user did not say \"goal\"; not for single-turn work."""
     async def edit(self, args: EditArgs) -> EditOutput:
-        """Edit an existing UTF-8 text file by replacing literal text."""
+        """Edit an existing UTF-8 text file by replacing literal text, or by id-addressed `ops` against a `line_ids` read."""
     async def get_goal(self, args: dict[str, Any]) -> GetGoalOutput1 | GetGoalOutput2:
         """Read the current session goal, including the id and revision that update_goal requires."""
     async def glob(self, args: GlobArgs) -> GlobOutput:
@@ -527,7 +627,7 @@ class Tools(Protocol):
     async def list_agents(self, args: ListAgentsArgs) -> list[ListAgentsOutput1 | ListAgentsOutput2]:
         """List subagents you started, with their ids, labels, and status. running means it is working; inactive means it is not currently working. You will be notified when a subagent finishes; there is no need to keep checking its status. Use send_message to continue the conversation."""
     async def read(self, args: ReadArgs) -> ReadOutput:
-        """Read a UTF-8 text file and return line-numbered content."""
+        """Read a UTF-8 text file and return line-numbered content (`line_ids=true` mints edit-addressable `N#hash` ids)."""
     async def read_image(self, args: ReadImageArgs) -> ReadImageOutput:
         """Read a PNG/JPEG/WebP/GIF file and return the image itself. Large images are downscaled automatically; do not install image libraries or create thumbnails to inspect an image."""
     async def send_message(self, args: SendMessageArgs) -> SendMessageOutput:

@@ -22,6 +22,7 @@ const TOOLS = '{{tools}}'
 const EVENT_TIME = '{{eventTime}}'
 const EVENT_OMITTED_BYTES = '{{eventOmittedBytes}}'
 const SOURCE_SESSION_FORMAT = '{{sourceSessionFormatVersion}}'
+const FS_VERSION = '{{fsVersion}}'
 const PACKED_CHUNK_ROW_TYPES = new Set(['text-chunks', 'reasoning-chunks', 'tool-call-chunks'])
 
 function isPackedFixtureRow(record: Record<string, unknown>): boolean {
@@ -229,6 +230,12 @@ function scrubValue(
       (value as { sessionUpdate?: unknown }).sessionUpdate === 'usage_update'
       && typeof (value as { used?: unknown }).used === 'number'
     ) out.used = USED_TOKENS
+    const persisted = (value as { fsObservation?: { observation?: { kind?: unknown; version?: unknown } } }).fsObservation
+    if (persisted?.observation?.kind === 'present' && typeof persisted.observation.version === 'string') {
+      // Provider versions contain device/inode/mtime/ctime and cannot be golden values.
+      const normalized = out.fsObservation as { observation: { version: string } }
+      normalized.observation.version = FS_VERSION
+    }
     return out
   }
   return value

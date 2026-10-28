@@ -11,7 +11,7 @@ Use the read tool — not shell commands like cat — to inspect text files. Use
 
 Read an existing file before overwriting it with write (the default fs-observation-policy requires it) and prefer edit for targeted changes.
 
-Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.
+Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session. For multi-hunk or staleness-prone edits, read with `line_ids=true` and edit with `ops` (id-addressed, hash-guarded); the reply carries a renumber map so chained edits skip the re-read.
 
 Use the glob tool — not shell find — to discover files by path pattern.
 
@@ -29,4 +29,4 @@ Use the workflow tool ONLY when the user explicitly asks for a workflow or for l
 
 Start independent delegations with `subagent` or `subagent_fork` together in one assistant message and continue useful work while they run. When only waiting for their results remains, end your turn instead of sleeping or polling; the next result starts a new turn.
 
-When you have your final answer, you MUST report it by calling the `structured_output` tool with arguments matching its parameter schema exactly. Do not finish with a plain text answer: only the tool call counts as your result.
+When you have your final answer, you MUST report it by calling the `structured_output` tool with arguments matching its parameter schema exactly. If your tools are presented through a `run_code` program (PTC mode), report by calling `tools.structured_output(args)` inside your `run_code` program as its final action instead. Do not finish with a plain text answer: only the tool call counts as your result.

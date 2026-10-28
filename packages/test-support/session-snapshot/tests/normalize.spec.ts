@@ -537,6 +537,25 @@ describe('normalizeSessionLog', () => {
     expect(out).toContain('"durationMs":88')
   })
 
+  it('stabilizes only persisted filesystem observation versions', () => {
+    const ev = JSON.stringify({
+      type: 'tool/result',
+      data: {
+        version: 'keep-this-version',
+        meta: {
+          fsObservation: {
+            target: { targetKey: '/tmp/a.txt', displayPath: '/tmp/a.txt' },
+            observation: { kind: 'present', version: 'dev:ino:size:mtime:ctime' },
+          },
+        },
+      },
+    })
+    const out = normalizeSessionLog(`${header({})}\n${ev}\n`, ctx)
+    expect(out).toContain('"version":"{{fsVersion}}"')
+    expect(out).toContain('"version":"keep-this-version"')
+    expect(out).not.toContain('dev:ino')
+  })
+
   it('normalizes goal lifecycle clocks without scrubbing unrelated payload timestamps', () => {
     const goal = JSON.stringify({
       type: 'goal/change',

@@ -10,6 +10,7 @@ import type { GenericCallView, ReadResultView, ToolResult } from '@deepseek-ai/d
 import type {} from '@deepseek-ai/dsh-fs'
 import { buildWindow, formatReadOutput, langFromPath, readMetaFromMeta } from './read-render.ts'
 import { resolveRegularReadTarget } from './read-target.ts'
+import { FS_OBSERVATION_RESULT_SCHEMA, observationResult } from './mutation-result.ts'
 
 /** Default and maximum number of lines returned by one `read` call (the `readLimit` config). */
 export const READ_LIMIT = 2000
@@ -37,6 +38,7 @@ interface ReadInput {
   filePath: string
   offset: number
   limit: number
+  lineIds: boolean
 }
 
 function parsePositiveInteger(value: number, name: string): number {
@@ -50,14 +52,17 @@ function parsePositiveInteger(value: number, name: string): number {
  * Validate value constraints the schema DSL can't express. `maxLimit` is the deployment's line cap.
  * @param args - the schema-validated raw tool arguments; `offset`/`limit` must be positive integers when given.
  * @param maxLimit - the configured line cap: both the default `limit` and the largest one accepted.
- * @returns the validated input with `offset` defaulted to 1 and `limit` to `maxLimit`.
+ * @returns the validated input with `offset` defaulted to 1, `limit` to `maxLimit`, and `lineIds` to false.
  */
-export function parseReadArgs(args: { file_path: string; offset?: number; limit?: number }, maxLimit: number): ReadInput {
+export function parseReadArgs(
+  args: { file_path: string; offset?: number; limit?: number; line_ids?: boolean },
+  maxLimit: number,
+): ReadInput {
   if (args.file_path.trim().length === 0) throw new Error('file_path must be a non-empty string')
   const offset = args.offset === undefined ? 1 : parsePositiveInteger(args.offset, 'offset')
   const limit = args.limit === undefined ? maxLimit : parsePositiveInteger(args.limit, 'limit')
   if (limit > maxLimit) throw new Error(`limit must be less than or equal to ${maxLimit}`)
-  return { filePath: args.file_path, offset, limit }
+  return { filePath: args.file_path, offset, limit, lineIds: args.line_ids === true }
 }
 
 /**
@@ -76,11 +81,16 @@ export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
 
   ctx.tools.register(defineTool({
     name: 'read',
-    description: 'Read a UTF-8 text file and return line-numbered content.',
+    description: 'Read a UTF-8 text file and return line-numbered content (`line_ids=true` mints edit-addressable `N#hash` ids).',
     parameters: {
       file_path: { type: 'string', required: true, description: 'Path to read, resolved by the filesystem backend.' },
       offset: { type: 'number', description: '1-based first line to return. Defaults to 1.' },
       limit: { type: 'number', description: `Maximum number of lines to return. Defaults to ${caps.limit}.` },
+      line_ids: {
+        type: 'boolean',
+        description: 'Mint a `N#hash` id per line and wrap over-long lines into exact-join `>` segments'
+          + ' (a `!` line declares a tail beyond the per-line cap). Use when you will edit with `ops`.',
+      },
     },
     output: {
       schema: {
@@ -98,10 +108,14 @@ export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
               properties: {
                 number: { type: 'integer', required: true },
                 text: { type: 'string', required: true },
+                id: { type: 'string', description: 'Line id `N#hash`, present in `line_ids` mode.' },
+                continued: { type: 'boolean', description: 'The line continues on the next entry (exact-join).' },
+                lineTruncated: { type: 'integer', description: 'Hidden tail chars beyond the per-line cap.' },
               },
             },
           },
           totalLines: { type: 'integer', required: true },
+          fsObservation: FS_OBSERVATION_RESULT_SCHEMA,
         },
       },
       render: (args, value) => {
@@ -128,6 +142,7 @@ export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
           offset: value.offset,
           lines: value.lines.map(({ number, text }) => ({ number, text })),
           totalLines: value.totalLines,
+          fsObservation: value.fsObservation,
           ...lang === undefined ? {} : { lang },
         }
       },
@@ -147,7 +162,7 @@ export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
         : [await ctx.fs.readText(target, exec.signal)]
       const window = await buildWindow(
         chunks,
-        { offset: input.offset, limit: input.limit, maxLineLength: caps.maxLineLength, maxBytes: caps.maxBytes },
+        { offset: input.offset, limit: input.limit, maxLineLength: caps.maxLineLength, maxBytes: caps.maxBytes, lineIds: input.lineIds },
         target.displayPath,
       )
 
@@ -161,7 +176,7 @@ export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
       // read already succeeded; an fs/observed listener is contractually a
       // synchronous, side-effect-only recorder.
       ctx.emit('fs/observed', target, { kind: 'present', version: info.version }, exec)
-      return outcome
+      return { ...outcome, ...observationResult(target, { kind: 'present', version: info.version }) }
     },
     // Result-time display: a `read` card carrying the structured line window a
     // capable UI renders as a line-numbered, syntax-highlighted view. The

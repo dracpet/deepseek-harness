@@ -8,7 +8,7 @@ Use the read tool — not shell commands like cat — to inspect text files. Use
 
 Read an existing file before overwriting it with write (the default fs-observation-policy requires it) and prefer edit for targeted changes.
 
-Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.
+Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session. For multi-hunk or staleness-prone edits, read with `line_ids=true` and edit with `ops` (id-addressed, hash-guarded); the reply carries a renumber map so chained edits skip the re-read.
 
 Use the glob tool — not shell find — to discover files by path pattern.
 
