@@ -27,6 +27,24 @@ import type { LocalTarget } from '../src/fsio.ts'
 import { copyFileDaclWin32, readFileDaclWin32 } from '../src/win32.ts'
 import { FsError, FsTargetKey } from '@deepseek-ai/dsh-fs'
 
+/**
+ * Run a literal edit expected to fail and return the typed failure, so the
+ * assertions read the error's own fields instead of comparing against an
+ * untyped matcher object.
+ * @param content - the file content handed to the edit.
+ * @param oldString - the search text handed to the edit.
+ * @returns the thrown FsError.
+ */
+function editFailure(content: string, oldString: string): FsError {
+  try {
+    applyLiteralEdit(content, oldString, 'X', false, 'f')
+  } catch (error) {
+    if (error instanceof FsError) return error
+    throw error
+  }
+  throw new Error('expected applyLiteralEdit to throw')
+}
+
 let dir: string
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'dsh-fsio-'))
@@ -959,6 +977,65 @@ describe('applyLiteralEdit', () => {
 
   it('matches across normalized line endings', () => {
     expect(applyLiteralEdit('one\ntwo', 'one\ntwo', 'x', false, 'f').replacements).toBe(1)
+  })
+
+  it('zero-hit appends a closest-match hint anchored on the longest common prefix', () => {
+    const content = 'alpha\n  beta gamma\ndelta'
+    const failure = editFailure(content, '  beta NEW\nthird')
+    expect(failure.code).toBe('FS_EDIT_NOT_FOUND')
+    expect(failure.message).toContain('closest match around line 2')
+  })
+
+  it('zero-hit anchors the hint on the exact head-line hit when the tail diverges', () => {
+    const failure = editFailure('one\ntwo\nthree', 'two\nDIFFERENT')
+    expect(failure.code).toBe('FS_EDIT_NOT_FOUND')
+    expect(failure.message).toContain('two\nthree')
+  })
+
+  it('zero-hit suppresses the hint when nothing is similar (a genuine absence)', () => {
+    const failure = editFailure('aaa bbb', 'zzz yyy')
+    expect(failure.code).toBe('FS_EDIT_NOT_FOUND')
+    expect(failure.message).not.toContain('closest match')
+  })
+
+  it('leaves the exact-hit path untouched (no hint when the edit applies)', () => {
+    expect(applyLiteralEdit('one\ntwo\nthree', 'two', 'X', false, 'f')).toEqual({
+      content: 'one\nX\nthree',
+      replacements: 1,
+    })
+  })
+
+  it('zero-hit locates a gutter-shifted head through a substring probe', () => {
+    const content = 'AAA\nconst target = compute(alpha, beta, gamma)  // tail\nBBB'
+    const failure = editFailure(content, '  const target = compute(alpha, beta, gamma)\nZZZ')
+    expect(failure.code).toBe('FS_EDIT_NOT_FOUND')
+    expect(failure.message).toContain('shares the substring')
+  })
+
+  it('zero-hit names a candidate line that differs only in surrounding whitespace', () => {
+    const failure = editFailure('AAA\nconst x = 1\nBBB', 'const x = 1  \nZZZ')
+    expect(failure.code).toBe('FS_EDIT_NOT_FOUND')
+    expect(failure.message).toContain('matches the head line up to surrounding whitespace')
+  })
+
+  it('zero-hit reports lines hidden by the read cap even when nothing is similar', () => {
+    // 2100 chars is longer than the 2000-char READ_LINE_TRUNCATION cap.
+    const failure = editFailure(`AAA\n${'x'.repeat(2100)}\nBBB`, 'zzz not here at all')
+    expect(failure.code).toBe('FS_EDIT_NOT_FOUND')
+    expect(failure.message).toContain('char read cap')
+  })
+
+  it('clips the quoted window so one huge line cannot blow up the hint', () => {
+    const content = `AAA\n${'y'.repeat(50000)}\nBBB`
+    let message = ''
+    try {
+      applyLiteralEdit(content, `  ${'y'.repeat(300)}  \nZZZ`, 'X', false, 'f')
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message).toContain('closest match around line 2')
+    expect(message).toContain('window clipped')
+    expect(message.length).toBeLessThan(8192)
   })
 })
 

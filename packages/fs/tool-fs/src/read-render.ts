@@ -6,6 +6,8 @@
  */
 
 import { FsError } from '@deepseek-ai/dsh-fs'
+import { createHash, type Hash } from 'node:crypto'
+import { formatLineId, LINE_IDS_LINE_CAP } from './id-edit.ts'
 
 /** Default maximum characters returned for a single line (the `readMaxLineLength` config). */
 export const READ_MAX_LINE_LENGTH = 2000
@@ -23,6 +25,10 @@ export interface ReadWindow {
   maxLineLength: number
   /** Maximum bytes of selected output; overflow stops the scan and marks `truncatedByBytes`. */
   maxBytes: number
+  /** Mint a `N#hash` id per line and wrap over-long lines losslessly (the `line_ids` arg). */
+  lineIds?: boolean
+  /** Per-line storage cap in `line_ids` mode; the hash still covers the whole line. */
+  lineIdsLineCap?: number
 }
 
 /** One line returned from a text file. */
@@ -31,6 +37,12 @@ export interface FileTextLine {
   number: number
   /** Line text without its trailing newline. */
   text: string
+  /** Line id `N#hash` minted in `line_ids` mode; the hash addresses the whole line. */
+  id?: string
+  /** This segment continues on the next emitted entry — join by exact concatenation. */
+  continued?: boolean
+  /** Characters of this line beyond the storage cap that were not rendered (declared truncation). */
+  lineTruncated?: number
 }
 
 /** The windowed result {@link buildWindow} produces from a file's decoded text. */
@@ -88,8 +100,88 @@ function consumeLine(acc: WindowAccumulator, rawLine: string, request: ReadWindo
   acc.lines.push({ number: acc.totalLines, text })
 }
 
+/**
+ * Emit one full line in `line_ids` mode: short lines render as one entry;
+ * over-long lines wrap into `maxLineLength` segments that re-join by exact
+ * concatenation (`continued` marks every segment but the last). A line beyond
+ * the storage cap emits its prefix with `lineTruncated` naming the hidden tail
+ * — a declared truncation, never the silent 2000-char stub.
+ */
+function consumeLineIds(
+  acc: WindowAccumulator,
+  rawLine: string,
+  meta: { hash: string; length: number; capped: boolean },
+  request: ReadWindow,
+): void {
+  acc.totalLines += 1
+  if (acc.truncatedByBytes || acc.totalLines < request.offset || acc.lines.length >= request.limit) return
+
+  const id = formatLineId(acc.totalLines, meta.hash)
+  const push = (text: string, continued: boolean, lineTruncated?: number): void => {
+    // Account the rendered form (id + one marker char + one space) so the byte
+    // budget covers what the model actually receives.
+    const rendered = `${id}${continued ? '>' : '|'} ${text}`
+    const bytes = lineByteSize(rendered, acc.lines.length)
+    if (acc.outputBytes + bytes > request.maxBytes) {
+      acc.truncatedByBytes = true
+      return
+    }
+    acc.outputBytes += bytes
+    acc.lines.push({
+      number: acc.totalLines,
+      text,
+      id,
+      ...continued ? { continued: true } : {},
+      ...lineTruncated !== undefined ? { lineTruncated } : {},
+    })
+  }
+
+  if (rawLine.length <= request.maxLineLength && !meta.capped) {
+    push(rawLine, false)
+    return
+  }
+  const segments: string[] = []
+  for (let at = 0; at < rawLine.length; at += request.maxLineLength) {
+    segments.push(rawLine.slice(at, at + request.maxLineLength))
+  }
+  if (segments.length === 0) segments.push('')
+  segments.forEach((segment, index) => {
+    if (acc.truncatedByBytes) return
+    const last = index === segments.length - 1
+    push(segment, !last, last && meta.capped ? meta.length - rawLine.length : undefined)
+  })
+}
+
 function stripCarriageReturn(line: string): string {
   return line.endsWith('\r') ? line.slice(0, -1) : line
+}
+
+/**
+ * Incremental per-line hasher for `line_ids` mode. Every segment is fed (even
+ * beyond the render/storage cap, so the id addresses the WHOLE line); the last
+ * character of each segment is held back so a trailing `\r` — stripped from the
+ * rendered text — is also excluded from the digest, keeping the id identical to
+ * the one the edit side computes over LF-normalized content.
+ */
+class LineHasher {
+  private hash: Hash = createHash('sha1')
+  private pending: string | undefined
+  /** Characters fed so far, including a trailing `\r` if present. */
+  total = 0
+
+  update(segment: string): void {
+    this.total += segment.length
+    if (this.pending !== undefined) this.hash.update(this.pending)
+    this.pending = segment.slice(-1)
+    this.hash.update(segment.slice(0, -1))
+  }
+
+  /** Finalize: the content hash plus the line length as the edit side sees it (no trailing CR). */
+  finalize(): { hash: string; length: number } {
+    const stripped = this.pending === '\r' ? 1 : 0
+    if (this.pending !== undefined && this.pending !== '\r') this.hash.update(this.pending)
+    return { hash: this.hash.digest('hex').slice(0, 8), length: this.total - stripped }
+  }
 }
 
 function finish(acc: WindowAccumulator, request: ReadWindow, displayPath: string): WindowResult {
@@ -114,18 +206,33 @@ export async function buildWindow(
   displayPath: string,
 ): Promise<WindowResult> {
   const acc = newAccumulator()
-  // One char past the truncation point is enough to prove a line overflows.
-  const lineBufferCap = request.maxLineLength + 1
+  const lineIds = request.lineIds === true
+  // Plain mode: one char past the truncation point proves a line overflows.
+  // line_ids mode: store up to the per-line cap for lossless wrapping; the
+  // hasher sees the whole line regardless, so ids always address full content.
+  const lineStorageCap = lineIds ? (request.lineIdsLineCap ?? LINE_IDS_LINE_CAP) : request.maxLineLength + 1
   let lineBuffer = ''
+  let hasher: LineHasher | undefined
 
   function appendToLineBuffer(segment: string): void {
-    if (lineBuffer.length >= lineBufferCap) return
+    if (lineIds) {
+      hasher ??= new LineHasher()
+      hasher.update(segment)
+    }
+    if (lineBuffer.length >= lineStorageCap) return
     lineBuffer += segment
-    if (lineBuffer.length > lineBufferCap) lineBuffer = lineBuffer.slice(0, lineBufferCap)
+    if (lineBuffer.length > lineStorageCap) lineBuffer = lineBuffer.slice(0, lineStorageCap)
   }
 
   function flushLine(): void {
-    consumeLine(acc, stripCarriageReturn(lineBuffer), request)
+    if (lineIds) {
+      const state = (hasher ?? new LineHasher()).finalize()
+      const stored = stripCarriageReturn(lineBuffer)
+      consumeLineIds(acc, stored, { hash: state.hash, length: state.length, capped: state.length > stored.length }, request)
+      hasher = undefined
+    } else {
+      consumeLine(acc, stripCarriageReturn(lineBuffer), request)
+    }
     lineBuffer = ''
   }
 
@@ -141,6 +248,21 @@ export async function buildWindow(
   }
   if (lineBuffer.length > 0) flushLine()
   return finish(acc, request, displayPath)
+}
+
+/**
+ * Render one window line: plain mode keeps the `N: text` shape; `line_ids`
+ * mode prints `N#hash| text`, `N#hash> segment` for join-by-concatenation
+ * continuations, and a trailing `N#hash! (…)` declaration when the line's tail
+ * exceeded the storage cap.
+ */
+function formatOutputLine(line: FileTextLine): string {
+  if (line.id === undefined) return `${line.number}: ${line.text}`
+  const marker = line.continued ? '>' : '|'
+  const tail = line.lineTruncated !== undefined
+    ? `\n${line.id}! (${String(line.lineTruncated)} more char${line.lineTruncated === 1 ? '' : 's'} on this line not shown)`
+    : ''
+  return `${line.id}${marker} ${line.text}${tail}`
 }
 
 /**
@@ -160,7 +282,7 @@ export function formatReadOutput(displayPath: string, outcome: FileReadOutcome):
     footer = `(End of file - total ${outcome.totalLines} lines)`
   }
   const body = outcome.lines.length > 0
-    ? `${outcome.lines.map(line => `${line.number}: ${line.text}`).join('\n')}\n\n${footer}`
+    ? `${outcome.lines.map(formatOutputLine).join('\n')}\n\n${footer}`
     : footer
   return `<path>${displayPath}</path>
 <type>file</type>

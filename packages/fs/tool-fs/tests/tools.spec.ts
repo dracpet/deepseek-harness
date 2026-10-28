@@ -181,15 +181,17 @@ describe('registration', () => {
   })
 
   it.each([
-    { name: 'write', fields: ['content'], hint: 'Provide `file_path` before `content` in the arguments.' },
-    { name: 'edit', fields: ['old_string', 'new_string'], hint: 'Provide `file_path` before `old_string` and `new_string` in the arguments.' },
-  ])('requests file_path before content fields for $name', async ({ name, fields, hint }) => {
+    { name: 'write', fields: ['content'], hint: 'Provide `file_path` before `content` in the arguments.', required: ['file_path', 'content'] },
+    // upstream-tool-fs-line-ids: ops mode made the literal pair optional at the
+    // schema level (the mode rule is enforced by parseEditArgs at runtime).
+    { name: 'edit', fields: ['old_string', 'new_string'], hint: 'Provide `file_path` before `old_string` and `new_string` in the arguments.', required: ['file_path'] },
+  ])('requests file_path before content fields for $name', async ({ name, fields, hint, required }) => {
     const { ctx } = await setup()
     try {
       const schema = ctx.tools.schemas().find(tool => tool.name === name)!
       expect(Object.keys(schema.parameters.properties as Record<string, unknown>).slice(0, fields.length + 1))
         .toEqual(['file_path', ...fields])
-      expect(schema.parameters).toHaveProperty('required', ['file_path', ...fields])
+      expect(schema.parameters).toHaveProperty('required', required)
       expect(schema.parameters).toHaveProperty('properties.file_path.description', expect.stringContaining(hint))
     } finally {
       await ctx.fiber.dispose()
@@ -511,6 +513,100 @@ describe('edit tool', () => {
     const result = await call(ctx, 'edit', { file_path: 'a.txt', old_string: 'a', new_string: 'b' }, { session: { header: {} } })
     expect(result.isError).toBe(true)
     expect(result.error).toMatchObject({ info: { code: 'FS_NOT_OBSERVED' } })
+  })
+})
+
+describe('edit ops mode (id-addressed, upstream-tool-fs-line-ids)', () => {
+  const agent = { session: { header: {} } }
+
+  const readWithIds = async (ctx: Context, path: string): Promise<string[]> => {
+    const result = await call(ctx, 'read', { file_path: path, line_ids: true }, agent)
+    expect(result.isError).toBe(false)
+    const body = text(result)
+    return [...body.matchAll(/(\d+#[0-9a-f]{8})\|/g)].map(match => match[1]!)
+  }
+
+  it('edits by id through the gate after a line_ids read, and reports renumber', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'alpha\nbravo\ncharlie\n')
+    const ids = await readWithIds(ctx, 'a.txt')
+    expect(ids).toHaveLength(3)
+
+    const result = await call(ctx, 'edit', {
+      file_path: 'a.txt',
+      ops: [{ op: 'replace', id: ids[1], text: 'BRAVO' }],
+    }, agent)
+    expect(result.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('alpha\nBRAVO\ncharlie\n')
+    expect(text(result)).toContain('1 op applied')
+    expect(text(result)).toContain('replaced: 1 line at 2 (first id 2#')
+    // The write path carried the gate's CAS basis.
+    expect(fs.writeIntents.at(-1)).toEqual({ kind: 'replaceIfVersion', version: FsVersion('v1') })
+  })
+
+  it('refuses an unread target through the gate, then self-heals like literal mode', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'alpha\n')
+    const result = await call(ctx, 'edit', {
+      file_path: 'a.txt',
+      ops: [{ op: 'replace', id: `1#${'0'.repeat(8)}`, text: 'x' }],
+    }, agent)
+    expect(result.isError).toBe(true)
+    expect(result.error).toMatchObject({ info: { code: 'FS_NOT_OBSERVED' } })
+    // The recovery registered the observation — a retry with fresh ids passes the gate.
+    const ids = await readWithIds(ctx, 'a.txt')
+    const retry = await call(ctx, 'edit', { file_path: 'a.txt', ops: [{ op: 'replace', id: ids[0], text: 'ALPHA' }] }, agent)
+    expect(retry.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('ALPHA\n')
+  })
+
+  it('refuses a stale id with an actionable message naming the current hash', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'alpha\nbravo\n')
+    const ids = await readWithIds(ctx, 'a.txt')
+    // A bash-lane write (no observation) changes the file after the read.
+    fs.files.set('key:a.txt', 'alpha\nCHANGED\n')
+    const result = await call(ctx, 'edit', { file_path: 'a.txt', ops: [{ op: 'replace', id: ids[1], text: 'x' }] }, agent)
+    expect(result.isError).toBe(true)
+    expect(text(result)).toMatch(/no line carries hash .* Line 2 is now "CHANGED"/)
+  })
+
+  it('chains a second ops edit without a re-read (renumber keeps addressing)', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'alpha\nbravo\ncharlie\n')
+    const ids = await readWithIds(ctx, 'a.txt')
+    const first = await call(ctx, 'edit', {
+      file_path: 'a.txt',
+      ops: [{ op: 'delete', id: ids[1] }],
+    }, agent)
+    expect(first.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('alpha\ncharlie\n')
+    // charlie was line 3, is now line 2; its hash self-locates it.
+    const second = await call(ctx, 'edit', {
+      file_path: 'a.txt',
+      ops: [{ op: 'replace', id: ids[2], text: 'CHARLIE' }],
+    }, agent)
+    expect(second.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('alpha\nCHARLIE\n')
+  })
+
+  it('rejects mixing ops with the literal pair', async () => {
+    const { ctx } = await setup()
+    const result = await call(ctx, 'edit', {
+      file_path: 'a.txt', old_string: 'a', new_string: 'b', ops: [{ op: 'delete', id: '1#abcdef12' }],
+    }, agent)
+    expect(result.isError).toBe(true)
+    expect(text(result)).toContain('pick one mode')
+  })
+
+  it('keeps the literal mode untouched when ops is absent (regression)', async () => {
+    const { ctx, fs } = await setup()
+    fs.files.set('key:a.txt', 'hello world')
+    await call(ctx, 'read', { file_path: 'a.txt' }, agent)
+    const result = await call(ctx, 'edit', { file_path: 'a.txt', old_string: 'world', new_string: 'there' }, agent)
+    expect(result.isError).toBe(false)
+    expect(fs.files.get('key:a.txt')).toBe('hello there')
+    expect(fs.editIntents).toHaveLength(1)
   })
 })
 
@@ -1151,7 +1247,9 @@ async function guidanceScope(ctx: Context) {
 const originalGuidance = {
   read: 'Use the read tool — not shell commands like cat — to inspect text files. Use offset and limit to continue reading large files.',
   write: 'Read an existing file before overwriting it with write (the default fs-observation-policy requires it) and prefer edit for targeted changes.',
-  edit: 'Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.',
+  // upstream-tool-fs-line-ids: the edit guidance gained the ops-mode sentence.
+  edit: 'Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.'
+    + ' For multi-hunk or staleness-prone edits, read with `line_ids=true` and edit with `ops` (id-addressed, hash-guarded); the reply carries a renumber map so chained edits skip the re-read.',
 }
 
 describe('scope-aware filesystem guidance', () => {

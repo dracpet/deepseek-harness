@@ -825,6 +825,162 @@ export async function readTextForDiff(
  * @param displayPath - the caller-facing path used in error messages.
  * @returns the edited LF-normalized content plus how many occurrences were replaced.
  */
+
+/**
+ * Length of the shared prefix of two strings — the offset of the first
+ * divergence, which is what a stale or re-wrapped `old_string` needs pointed
+ * out to be self-locating.
+ */
+function commonPrefixLength(a: string, b: string): number {
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    if (a[i] !== b[i]) return i
+  }
+  return n
+}
+
+/**
+ * Characters of a line the `read` window shows before truncating. A tail beyond
+ * this cap never reaches the caller, which is a first-class cause of a stale
+ * `old_string`; the number is duplicated on purpose — this provider layer must
+ * not import the tool layer — and is kept in sync by hand with
+ * `READ_MAX_LINE_LENGTH` in `@deepseek-ai/dsh-tool-fs`.
+ */
+const READ_LINE_TRUNCATION = 2000
+
+/** Shortest substring probe worth searching for: below this a hit is coincidence, not a witness. */
+const MIN_SUBSTRING_PROBE = 12
+
+/**
+ * Size budget for the quoted window. Without it a file whose lines reach 84K
+ * characters (this project's board/ledger files) yields a ~90KB error message
+ * that host-side tool-result pruning then cuts in half, losing exactly the
+ * middle the caller needs.
+ */
+const HINT_LINE_MAX = 400
+const HINT_TOTAL_MAX = 4000
+
+/** Line index (0-based) holding a character offset in LF-normalized content. */
+function lineIndexAtOffset(content: string, offset: number): number {
+  let line = 0
+  for (let i = 0; i < offset; i++) {
+    if (content[i] === '\n') line++
+  }
+  return line
+}
+
+/**
+ * Quote a line window for a hint under the size budget: clip each line and the
+ * whole quote, announcing the clip so a shortened window is never mistaken for
+ * the file's real content.
+ * @param window - the content lines around the anchor.
+ * @returns the quoted window, with a trailing note when it was clipped.
+ */
+function quoteWindow(window: readonly string[]): string {
+  const clipped: string[] = []
+  let budget = HINT_TOTAL_MAX
+  let shortened = false
+  for (const line of window) {
+    let piece = line
+    if (piece.length > HINT_LINE_MAX) {
+      piece = `${piece.slice(0, HINT_LINE_MAX)}…`
+      shortened = true
+    }
+    if (piece.length > budget) {
+      piece = `${piece.slice(0, Math.max(0, budget - 1))}…`
+      shortened = true
+    }
+    clipped.push(piece)
+    budget -= piece.length + 1
+    if (budget <= 0) {
+      if (clipped.length < window.length) shortened = true
+      break
+    }
+  }
+  if (!shortened) return window.join('\n')
+  return `${clipped.join('\n')}\n(window clipped to ${HINT_LINE_MAX} chars/line, ${HINT_TOTAL_MAX} chars total)`
+}
+
+/**
+ * Build a "closest match" hint for a zero-hit literal edit, so a stale or
+ * physically re-wrapped `old_string` self-locates instead of drawing a blind
+ * retry. The anchor line is the first non-blank search line, located by, in
+ * order: an exact occurrence; a file line equal to it up to surrounding
+ * whitespace; a substring probe of its leading characters (which survives
+ * gutter shifts and re-wrapping); and finally the file line sharing its longest
+ * common prefix. A small window around the anchor is quoted, clipped to a
+ * readable size. Any line longer than the read cap is reported even when
+ * nothing is similar — that tail is invisible to `read`, so it cannot be
+ * rebuilt from memory. Hints are
+ * suppressed for >2MiB files and for zero similarity (a genuine absence must
+ * not be misled toward an unrelated line).
+ * @param content - the current file content, already LF-normalized.
+ * @param oldString - the LF-normalized search text.
+ * @returns the diagnostic suffix, or an empty string when suppressed.
+ */
+function closestMatchHint(content: string, oldString: string): string {
+  const MAX_HINT_CONTENT = 2 * 1024 * 1024
+  if (content.length > MAX_HINT_CONTENT) return ''
+  const searchLines = oldString.split('\n').filter(line => line.trim().length > 0)
+  if (searchLines.length === 0) return ''
+  const contentLines = content.split('\n')
+  const head = searchLines[0]
+  if (head === undefined) return ''
+  const overCap = contentLines.filter(line => line.length > READ_LINE_TRUNCATION).length
+  const readCapNote = overCap === 0
+    ? ''
+    : `\nnote: ${overCap} line(s) here are longer than the ${READ_LINE_TRUNCATION}-char read cap, so their tails were never shown — fetch the exact bytes (sed -n 'Np' <file> | cat -A, or grep -o) before rebuilding old_string`
+  let anchor = -1
+  let relation = ''
+  for (let i = 0; i < contentLines.length && anchor < 0; i++) {
+    const line = contentLines[i]
+    if (line !== undefined && line.includes(head)) {
+      anchor = i
+      relation = 'contains the head line'
+    }
+  }
+  if (anchor < 0) {
+    const trimmed = head.trim()
+    for (let i = 0; i < contentLines.length && anchor < 0; i++) {
+      const line = contentLines[i]
+      if (line !== undefined && line.trim() === trimmed) {
+        anchor = i
+        relation = 'matches the head line up to surrounding whitespace'
+      }
+    }
+  }
+  if (anchor < 0) {
+    const probe = head.trimStart().slice(0, 40).trimEnd()
+    if (probe.length >= MIN_SUBSTRING_PROBE) {
+      const at = content.indexOf(probe)
+      if (at >= 0) {
+        anchor = lineIndexAtOffset(content, at)
+        const shown = probe.length > 32 ? `${probe.slice(0, 32)}…` : probe
+        relation = `shares the substring ${JSON.stringify(shown)}`
+      }
+    }
+  }
+  if (anchor < 0) {
+    let best = -1
+    let bestLen = 0
+    for (let i = 0; i < contentLines.length; i++) {
+      const line = contentLines[i]
+      if (line === undefined) continue
+      const common = commonPrefixLength(line, head)
+      if (common > bestLen) { bestLen = common; best = i }
+    }
+    if (bestLen > 0) {
+      anchor = best
+      relation = `shares a ${bestLen}-character prefix with the head line`
+    }
+  }
+  if (anchor < 0) return readCapNote
+  const winStart = Math.max(0, anchor - 1)
+  const winEnd = Math.min(contentLines.length, winStart + searchLines.length + 3)
+  const quoted = quoteWindow(contentLines.slice(winStart, winEnd))
+  return ` — closest match around line ${anchor + 1} (${searchLines.length} search line(s)); it ${relation}:\n${quoted}\nre-read that line range and rebuild old_string byte-for-byte from the read output${readCapNote}`
+}
+
 export function applyLiteralEdit(
   content: string,
   oldString: string,
@@ -839,7 +995,7 @@ export function applyLiteralEdit(
   const newNorm = normalizeLineEndings(newString)
   const replacements = countOccurrences(content, oldNorm)
   if (replacements === 0) {
-    throw new FsError(`old_string was not found in "${displayPath}"`, 'FS_EDIT_NOT_FOUND')
+    throw new FsError(`old_string was not found in "${displayPath}"${closestMatchHint(content, oldNorm)}`, 'FS_EDIT_NOT_FOUND')
   }
   if (!replaceAll && replacements > 1) {
     throw new FsError(`old_string matched ${replacements} times in "${displayPath}"; provide a more specific old_string or set replace_all to true`, 'FS_AMBIGUOUS_EDIT')
